@@ -36,23 +36,63 @@ def clean_sql(raw: str) -> str:
     text = re.sub(r"```sql", "", text, flags=re.IGNORECASE)
     text = text.replace("```", "")
 
+    # Strip markdown bold markers some models (e.g. gpt-oss) wrap the query
+    # in instead of code fences (**SELECT ...**). Only strip double-asterisk
+    # bold markers — a single "*" is the legitimate SQL wildcard (SELECT *).
+    text = text.replace("**", "")
+
     # If there's still a "Question:" style echo before the query, cut it
     text = re.sub(r"^.*?Question:.*?(SELECT|WITH|INSERT|UPDATE|DELETE|SHOW|DESCRIBE)",
                    r"\1", text, flags=re.IGNORECASE | re.DOTALL)
 
-    text = text.strip().rstrip(";").strip()
+    text = text.strip()
+
+    # Cut off at the first semicolon: some models append trailing
+    # commentary/echoes ("**SQL Query:**", explanations, etc.) after the
+    # actual query ends. We only want the first statement.
+    if ";" in text:
+        text = text.split(";", 1)[0]
+
+    text = " ".join(text.split()).strip().rstrip(";").strip()
 
     # Validate: must actually start with a SQL command. If the model
     # replied with an apology / clarifying question instead of SQL,
     # fail loudly here rather than executing it against MySQL.
     if not re.match(r"^(SELECT|WITH|INSERT|UPDATE|DELETE|SHOW|DESCRIBE)\b", text, flags=re.IGNORECASE):
+        shown = raw.strip() or "(empty response)"
         raise ValueError(
             "The model didn't return a valid SQL query for that question "
-            f"(it said: \u201c{text[:150]}\u2026\u201d). Try rephrasing your "
+            f"(it said: \u201c{shown[:150]}\u2026\u201d). Try rephrasing your "
             "question to be more specific, e.g. mention the table or column name."
         )
 
     return text + ";"
+
+
+# Common greetings / small talk that shouldn't be sent through the SQL
+# pipeline at all. Kept intentionally simple (no LLM call) so it's fast,
+# free, and predictable. Anything not matched here still goes through the
+# normal SQL flow and clean_sql's validation as a safety net.
+_SMALL_TALK_RE = re.compile(
+    r"^\s*(hi|hello|hey|yo|sup|good\s?(morning|afternoon|evening)|"
+    r"how('?s| is| are) it going|how are you|what'?s up|"
+    r"thanks|thank you|thx|ty|bye|goodbye|see ya|ok|okay|cool|nice|great)"
+    r"[\s!.,?]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def small_talk_reply(text: str) -> str | None:
+    """Return a friendly canned reply if the message looks like small talk
+    rather than a database question, else None."""
+    if not _SMALL_TALK_RE.match(text.strip()):
+        return None
+    lowered = text.strip().lower()
+    if lowered.startswith(("thanks", "thank you", "thx", "ty")):
+        return "You're welcome! Ask me anything about your database whenever you're ready. 🙂"
+    if lowered.startswith(("bye", "goodbye", "see ya")):
+        return "Goodbye! Come back anytime you want to query your database. 👋"
+    return "Hey there! 👋 I'm your database assistant — ask me a question about your data, e.g. \"What are the top 5 customers by total revenue?\""
 
 # ----------------------------
 # Sidebar: DB + API connection
@@ -88,7 +128,7 @@ if connect_btn:
         db = SQLDatabase(engine)
 
         llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             temperature=0,
             api_key=groq_api_key,
         )
@@ -150,26 +190,31 @@ else:
             st.markdown(user_q)
 
         with st.chat_message("assistant"):
-            with st.spinner("Writing SQL and querying database..."):
-                try:
-                    sql_query = clean_sql(
-                        st.session_state.write_query.invoke({"question": user_q})
-                    )
-                    sql_result = st.session_state.execute_query.invoke(sql_query)
-                    answer = st.session_state.answer_chain.invoke(
-                        {"question": user_q, "query": sql_query, "result": sql_result}
-                    )
+            small_talk = small_talk_reply(user_q)
+            if small_talk is not None:
+                st.markdown(small_talk)
+                st.session_state.messages.append({"role": "assistant", "content": small_talk})
+            else:
+                with st.spinner("Writing SQL and querying database..."):
+                    try:
+                        sql_query = clean_sql(
+                            st.session_state.write_query.invoke({"question": user_q})
+                        )
+                        sql_result = st.session_state.execute_query.invoke(sql_query)
+                        answer = st.session_state.answer_chain.invoke(
+                            {"question": user_q, "query": sql_query, "result": sql_result}
+                        )
 
-                    st.markdown(answer)
-                    with st.expander("🔍 Generated SQL"):
-                        st.code(sql_query, language="sql")
-                    with st.expander("📊 Raw result"):
-                        st.text(sql_result)
+                        st.markdown(answer)
+                        with st.expander("🔍 Generated SQL"):
+                            st.code(sql_query, language="sql")
+                        with st.expander("📊 Raw result"):
+                            st.text(sql_result)
 
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": answer, "sql": sql_query}
-                    )
-                except Exception as e:
-                    err = f"⚠️ Something went wrong: {e}"
-                    st.error(err)
-                    st.session_state.messages.append({"role": "assistant", "content": err})
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": answer, "sql": sql_query}
+                        )
+                    except Exception as e:
+                        err = f"⚠️ Something went wrong: {e}"
+                        st.error(err)
+                        st.session_state.messages.append({"role": "assistant", "content": err})
